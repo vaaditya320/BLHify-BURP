@@ -1,3 +1,5 @@
 burp.jar
 *.class
 *.jar
+build/
+lib/

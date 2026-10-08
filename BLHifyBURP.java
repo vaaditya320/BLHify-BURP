@@ -1,402 +1,341 @@
-import burp.*;
+package burp;
 
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
-import java.net.HttpURLConnection;
-import java.net.URI;
+import javax.swing.*;
+import javax.swing.event.*;
+import javax.swing.table.*;
+import java.awt.*;
+import java.awt.datatransfer.StringSelection;
+import java.io.*;
 import java.net.URL;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.time.LocalTime;
+import java.time.format.DateTimeFormatter;
 import java.util.*;
+import java.util.List;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Matcher;
-import java.util.regex.Pattern;
+import java.util.zip.*;
 
-public class BLHifyBurp implements IBurpExtender, IHttpListener {
-
+/** UI and Burp integration. All inventory mutations take place on Swing's EDT. */
+public class BLHifyBURP implements IBurpExtender, IHttpListener, ITab, IExtensionStateListener {
     private IBurpExtenderCallbacks callbacks;
     private IExtensionHelpers helpers;
+    private volatile boolean unloaded, capture = true, automatic = true, scopeOnly;
+    private final ThreadPoolExecutor checks = pool("BLHify-check", 2, 200);
+    private final ThreadPoolExecutor discovery = pool("BLHify-discovery", 1, 24);
+    private final AtomicInteger pendingUi = new AtomicInteger();
+    private final Map<String,Long> cooldowns = new ConcurrentHashMap<>();
+    private final Map<String,Entry> inventory = new LinkedHashMap<>();
+    private final List<Entry> rows = new ArrayList<>();
+    private JPanel panel;
+    private JTable table;
+    private final LinkModel model = new LinkModel();
+    private TableRowSorter<LinkModel> sorter;
+    private JTextArea details, activity;
+    private JLabel summary;
+    private JTextField search;
+    private JComboBox<String> filter;
+    private volatile int generation;
+    private int sourceCount;
+    private static final int MAX_LINKS = 10000, MAX_SOURCES = 500;
 
-    private final Set<String> testedSocials = new HashSet<>();
-    private final Set<String> reportedFindings = new HashSet<>();
-
-    private static final Pattern SOCIAL_PATTERN = Pattern.compile(
-            "(https?://(?:www\\.)?(?:twitter\\.com|x\\.com|instagram\\.com|facebook\\.com|tiktok\\.com)/[a-zA-Z0-9_./@-]+)",
-            Pattern.CASE_INSENSITIVE
-    );
-
-    @Override
-    public void registerExtenderCallbacks(IBurpExtenderCallbacks callbacks) {
-        this.callbacks = callbacks;
-        this.helpers = callbacks.getHelpers();
-        callbacks.setExtensionName("BLHify - Broken Social Link Scanner");
-        callbacks.registerHttpListener(this);
-        callbacks.printOutput("[+] BLHify loaded successfully");
-        callbacks.printOutput("[+] Listening on all proxy traffic automatically");
+    private static ThreadPoolExecutor pool(String name, int size, int capacity) {
+        AtomicInteger sequence = new AtomicInteger();
+        return new ThreadPoolExecutor(size, size, 0, TimeUnit.MILLISECONDS, new ArrayBlockingQueue<>(capacity), task -> {
+            Thread thread = new Thread(task, name + "-" + sequence.incrementAndGet()); thread.setDaemon(true); return thread;
+        }, new ThreadPoolExecutor.AbortPolicy());
     }
-
-    @Override
-    public void processHttpMessage(int toolFlag, boolean messageIsRequest, IHttpRequestResponse messageInfo) {
-        if (messageIsRequest) return;
-        if (toolFlag != IBurpExtenderCallbacks.TOOL_PROXY) return;
-
-        byte[] response = messageInfo.getResponse();
-        if (response == null) return;
-
-        String body = new String(response);
-        Matcher matcher = SOCIAL_PATTERN.matcher(body);
-
-        while (matcher.find()) {
-            String socialUrl = matcher.group(1);
-            if (testedSocials.contains(socialUrl)) continue;
-            testedSocials.add(socialUrl);
-
-            callbacks.printOutput("[*] Checking: " + socialUrl);
-
-            if (isBrokenSocial(socialUrl)) {
-                String host = messageInfo.getHttpService().getHost();
-                String key = host + "|" + socialUrl;
-                if (reportedFindings.contains(key)) continue;
-                reportedFindings.add(key);
-
-                callbacks.printOutput("[!!!] BROKEN SOCIAL LINK: " + socialUrl);
-                callbacks.addScanIssue(new BLHIssue(
-                        messageInfo.getHttpService(),
-                        helpers.analyzeRequest(messageInfo).getUrl(),
-                        socialUrl
-                ));
-            } else {
-                callbacks.printOutput("[-] Alive: " + socialUrl);
-            }
-        }
+    @Override public void registerExtenderCallbacks(IBurpExtenderCallbacks callbacks) {
+        this.callbacks = callbacks; this.helpers = callbacks.getHelpers();
+        callbacks.setExtensionName("BLHify | Native Social Link Inspector");
+        Runnable setup = () -> {
+            buildUi(); callbacks.customizeUiComponent(panel); callbacks.addSuiteTab(this);
+            callbacks.registerExtensionStateListener(this); callbacks.registerHttpListener(this);
+            log("Ready. Capturing proxy responses; native anonymous checks enabled.");
+        };
+        try { if (SwingUtilities.isEventDispatchThread()) setup.run(); else SwingUtilities.invokeAndWait(setup); }
+        catch (Exception e) { checks.shutdownNow(); discovery.shutdownNow(); throw new IllegalStateException("Unable to initialize BLHify", e); }
     }
-
-    private boolean isBrokenSocial(String socialUrl) {
-        try {
-            String lower = socialUrl.toLowerCase();
-            if (lower.contains("twitter.com") || lower.contains("x.com")) {
-                return checkTwitter(socialUrl);
-            } else if (lower.contains("instagram.com")) {
-                return checkInstagram(socialUrl);
-            } else if (lower.contains("facebook.com")) {
-                return checkFacebook(socialUrl);
-            } else if (lower.contains("tiktok.com")) {
-                return checkTiktok(socialUrl);
-            }
-        } catch (Exception e) {
-            callbacks.printOutput("    Error: " + e.getMessage());
-        }
-        return false;
-    }
-
-    // ===================== FACEBOOK =====================
-    // Confirmed from Burp response: dead pages return JSON with:
-    // "title": "This content isn't available at the moment"
-    // "body": "When this happens, it's usually because..."
-    // "__dr": "CometErrorRoot.react"
-    // All inside a 200 response from /username endpoint
-    private boolean checkFacebook(String socialUrl) {
-        try {
-            String fbUrl = socialUrl.replaceFirst("(?i)^https?://(?:www\\.)?facebook\\.com",
-                    "https://www.facebook.com");
-            callbacks.printOutput("    [FB] Fetching: " + fbUrl);
-
-            HttpURLConnection conn = openConnection(fbUrl);
-            int status = conn.getResponseCode();
-            String finalUrl = conn.getURL().toString().toLowerCase();
-            callbacks.printOutput("    [FB] Status: " + status + " | Final: " + finalUrl);
-
-            // Redirect to login = definitely dead/private
-            if (finalUrl.contains("/login") || finalUrl.contains("/r.php") ||
-                finalUrl.contains("checkpoint")) {
-                callbacks.printOutput("    [FB] -> Dead (redirected to login)");
-                return true;
-            }
-
-            if (status == 404) {
-                callbacks.printOutput("    [FB] -> Dead (404)");
-                return true;
-            }
-
-            // Read full body - Facebook embeds error in JSON inside the HTML
-            String body = readFullBody(conn);
-            callbacks.printOutput("    [FB] Body length: " + body.length());
-
-            // CONFIRMED exact strings from Burp intercept
-            if (body.contains("This content isn't available at the moment") ||
-                body.contains("This content isn\u2019t available at the moment") ||
-                body.contains("CometErrorRoot.react") ||
-                body.contains("\"title\":\"This content") ||
-                body.contains("isAdminViewingDeactivatedProfile") ||  // appears in dead profile JSON
-                body.contains("PageNotFound") ||
-                body.contains("page_not_found") ||
-                body.contains("\"__type\":404") ||
-                body.contains("contentNotFound")) {
-                callbacks.printOutput("    [FB] -> Dead (confirmed error in JSON response)");
-                return true;
-            }
-
-        } catch (Exception e) {
-            callbacks.printOutput("    [FB] Error: " + e.getMessage());
-        }
-        return false;
-    }
-
-    // ===================== INSTAGRAM =====================
-    // Instagram raw HTML DOES contain the error message (confirmed from screenshot)
-    // "Sorry, this page isn't available."
-    // "The link you followed may be broken, or the page may have been removed."
-    private boolean checkInstagram(String socialUrl) {
-        try {
-            String igUrl = socialUrl.replaceFirst("(?i)^https?://(?:www\\.)?instagram\\.com",
-                    "https://www.instagram.com");
-            callbacks.printOutput("    [IG] Fetching: " + igUrl);
-
-            HttpURLConnection conn = openConnection(igUrl);
-            int status = conn.getResponseCode();
-            String finalUrl = conn.getURL().toString().toLowerCase();
-            callbacks.printOutput("    [IG] Status: " + status + " | Final: " + finalUrl);
-
-            if (status == 404) {
-                callbacks.printOutput("    [IG] -> Dead (404)");
-                return true;
-            }
-
-            if (finalUrl.contains("/accounts/login") || finalUrl.contains("/challenge/")) {
-                callbacks.printOutput("    [IG] -> Dead (redirected to login)");
-                return true;
-            }
-
-            String body = readFullBody(conn);
-            callbacks.printOutput("    [IG] Body length: " + body.length());
-
-            // Confirmed from screenshot - these strings appear in raw HTML
-            if (body.contains("Sorry, this page isn") ||
-                body.contains("Sorry, this page isn\u2019t available") ||
-                body.contains("The link you followed may be broken") ||
-                body.contains("page may have been removed") ||
-                body.contains("Go back to Instagram")) {
-                callbacks.printOutput("    [IG] -> Dead (error message found in HTML)");
-                return true;
-            }
-
-            // Fallback: og:title check - dead page = "Instagram" only
-            Pattern ogTitle = Pattern.compile(
-                    "og:title\"[^>]*content=\"([^\"]+)\"", Pattern.CASE_INSENSITIVE);
-            Matcher m = ogTitle.matcher(body);
-            if (m.find()) {
-                String title = m.group(1).trim();
-                callbacks.printOutput("    [IG] og:title = " + title);
-                if (title.equalsIgnoreCase("instagram") || !title.contains("@")) {
-                    callbacks.printOutput("    [IG] -> Dead (generic og:title)");
-                    return true;
+    @Override public String getTabCaption() { return "BLHify"; }
+    @Override public Component getUiComponent() { return panel; }
+    private void buildUi() {
+        panel = new JPanel(new BorderLayout(12,12)); panel.setBorder(BorderFactory.createEmptyBorder(18,18,18,18));
+        JPanel header = new JPanel(new BorderLayout(8,8));
+        JLabel title = new JLabel("BLHify  /  Social Link Inspector"); title.setFont(title.getFont().deriveFont(Font.BOLD, 24f));
+        header.add(title, BorderLayout.NORTH);
+        header.add(new JLabel("Native checks for Facebook, Instagram and X  •  Select a link to see every source page"), BorderLayout.CENTER);
+        JPanel controls = new JPanel(new FlowLayout(FlowLayout.LEFT, 10, 4));
+        JCheckBox capturing = new JCheckBox("Capture proxy traffic", true); capturing.addActionListener(e -> capture = capturing.isSelected());
+        JCheckBox auto = new JCheckBox("Auto-check new links", true); auto.addActionListener(e -> automatic = auto.isSelected());
+        JCheckBox scoped = new JCheckBox("In-scope pages only", false); scoped.addActionListener(e -> scopeOnly = scoped.isSelected());
+        controls.add(capturing); controls.add(auto); controls.add(scoped); header.add(controls, BorderLayout.SOUTH);
+        panel.add(header, BorderLayout.NORTH);
+        JPanel center = new JPanel(new BorderLayout(8,8));
+        JPanel toolbar = new JPanel(new FlowLayout(FlowLayout.LEFT,8,0));
+        search = new JTextField(24); search.setToolTipText("Search social URL, source page, platform or reason");
+        filter = new JComboBox<>(new String[]{"All statuses", "UNAVAILABLE", "EXISTS", "UNKNOWN", "SUSPENDED", "UNSUPPORTED", "DISCOVERED", "QUEUED", "CHECKING"});
+        toolbar.add(new JLabel("Find")); toolbar.add(search); toolbar.add(filter);
+        button(toolbar, "Check selected", () -> selected().forEach(this::queue));
+        button(toolbar, "Check pending / unknown", () -> new ArrayList<>(rows).stream().filter(e -> e.result.status == SocialChecker.Status.DISCOVERED || e.result.status == SocialChecker.Status.UNKNOWN).forEach(this::queue));
+        button(toolbar, "Export CSV", this::exportCsv);
+        button(toolbar, "Clear", () -> { generation++; checks.getQueue().clear(); inventory.clear(); rows.clear(); sourceCount = 0; model.fireTableDataChanged(); refresh(); log("Inventory cleared. Already reported Burp issues remain in Burp."); });
+        JPanel toolbarRows = new JPanel(new GridLayout(0,1,0,7));
+        JPanel actionRow = new JPanel(new FlowLayout(FlowLayout.LEFT,8,0));
+        while (toolbar.getComponentCount() > 3) actionRow.add(toolbar.getComponent(3));
+        toolbarRows.add(toolbar); toolbarRows.add(actionRow); center.add(toolbarRows, BorderLayout.NORTH);
+        table = new JTable(model); table.setRowHeight(28); table.setAutoCreateRowSorter(false); table.setFillsViewportHeight(true);
+        table.setSelectionMode(ListSelectionModel.MULTIPLE_INTERVAL_SELECTION);
+        sorter = new TableRowSorter<>(model); table.setRowSorter(sorter);
+        table.getColumnModel().getColumn(1).setPreferredWidth(330); table.getColumnModel().getColumn(4).setPreferredWidth(320);
+        table.getColumnModel().getColumn(2).setCellRenderer(new DefaultTableCellRenderer() {
+            @Override public Component getTableCellRendererComponent(JTable t,Object v,boolean selected,boolean focus,int row,int col) {
+                super.getTableCellRendererComponent(t,v,selected,focus,row,col);
+                setFont(getFont().deriveFont(Font.BOLD));
+                if (!selected) {
+                    String status = String.valueOf(v);
+                    setForeground(status.equals("UNAVAILABLE") ? new Color(195,65,65) : status.equals("EXISTS") ? new Color(35,145,100)
+                        : status.equals("UNKNOWN") || status.equals("SUSPENDED") ? new Color(180,125,35) : t.getForeground());
                 }
+                return this;
             }
-
-        } catch (Exception e) {
-            callbacks.printOutput("    [IG] Error: " + e.getMessage());
-        }
-        return false;
+        });
+        details = area(); details.setText("Browse through Burp Proxy to discover social links.\nChecks run anonymously against the platforms themselves.\nUnavailable does not establish that a handle can be registered.");
+        activity = area();
+        JPanel detailPanel = new JPanel(new BorderLayout(5,5));
+        JPanel actions = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        button(actions, "Copy social URL", () -> { List<Entry> selection = selected(); if (!selection.isEmpty()) copy(selection.get(0).profile.url); });
+        button(actions, "Copy source URLs", () -> { List<Entry> selection = selected(); if (!selection.isEmpty()) copy(String.join("\n", selection.get(0).sources.keySet())); });
+        detailPanel.add(actions, BorderLayout.NORTH); detailPanel.add(new JScrollPane(details), BorderLayout.CENTER);
+        JTabbedPane bottom = new JTabbedPane(); bottom.addTab("Link details & source pages", detailPanel); bottom.addTab("Activity", new JScrollPane(activity));
+        JScrollPane tableScroll = new JScrollPane(table); tableScroll.setColumnHeaderView(table.getTableHeader());
+        JSplitPane split = new JSplitPane(JSplitPane.VERTICAL_SPLIT, tableScroll, bottom); split.setResizeWeight(.65); split.setDividerLocation(340);
+        center.add(split, BorderLayout.CENTER); panel.add(center, BorderLayout.CENTER);
+        summary = new JLabel("No social links yet"); panel.add(summary, BorderLayout.SOUTH);
+        table.getSelectionModel().addListSelectionListener(e -> { if (!e.getValueIsAdjusting()) showDetails(); });
+        search.getDocument().addDocumentListener(new DocumentListener() {
+            public void insertUpdate(DocumentEvent e) { applyFilter(); } public void removeUpdate(DocumentEvent e) { applyFilter(); } public void changedUpdate(DocumentEvent e) { applyFilter(); }
+        });
+        filter.addActionListener(e -> applyFilter());
     }
-
-    // ===================== TWITTER / X =====================
-    // X is fully JS rendered - raw HTML won't have the error message
-    // Best signals available without JS execution:
-    // 1. Redirect to login page
-    // 2. og:title = "X" with no @handle (dead account)
-    // 3. "UserUnavailable" in embedded JS data
-    // 4. Handle not present anywhere in source
-    private boolean checkTwitter(String socialUrl) {
+    private static JTextArea area() { JTextArea area = new JTextArea(); area.setEditable(false); area.setLineWrap(true); area.setWrapStyleWord(true); area.setBorder(BorderFactory.createEmptyBorder(10,10,10,10)); return area; }
+    private static void button(JPanel target,String title,Runnable action) { JButton button = new JButton(title); button.addActionListener(e -> action.run()); target.add(button); }
+    private void copy(String value) { try { Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(value), null); } catch (RuntimeException e) { log("Clipboard unavailable: " + e.getMessage()); } }
+    private void applyFilter() {
+        final String query = search.getText().toLowerCase(Locale.ROOT); final String status = (String) filter.getSelectedItem();
+        sorter.setRowFilter(new RowFilter<LinkModel,Integer>() {
+            @Override public boolean include(RowFilter.Entry<? extends LinkModel,? extends Integer> item) {
+                BLHifyBURP.Entry entry = rows.get(item.getIdentifier());
+                return ("All statuses".equals(status) || entry.result.status.name().equals(status))
+                    && (entry.profile.url + " " + entry.profile.platform + " " + entry.result.reason + " " + String.join(" ",entry.sources.keySet())).toLowerCase(Locale.ROOT).contains(query);
+            }
+        });
+    }
+    private List<Entry> selected() {
+        List<Entry> result = new ArrayList<>();
+        for (int index : table.getSelectedRows()) result.add(rows.get(table.convertRowIndexToModel(index)));
+        return result;
+    }
+    private void showDetails() {
+        List<Entry> selection = selected(); if (selection.isEmpty()) { details.setText("Select a social link to inspect its result and source pages."); return; }
+        Entry entry = selection.get(0);
+        StringBuilder text = new StringBuilder(entry.profile.url).append("\n\nStatus: ").append(entry.result.status)
+            .append("\nEvidence: ").append(entry.result.reason).append("\nLast checked: ").append(entry.checked)
+            .append("\n\nFound on ").append(entry.sources.size()).append(" page(s):\n");
+        for (Source source : entry.sources.values()) text.append("\n").append(source.url).append("\n  Original link: ").append(source.original).append('\n');
+        details.setText(text.toString()); details.setCaretPosition(0);
+    }
+    private void refresh() {
+        long unavailable = rows.stream().filter(e -> e.result.status == SocialChecker.Status.UNAVAILABLE).count();
+        long unknown = rows.stream().filter(e -> e.result.status == SocialChecker.Status.UNKNOWN).count();
+        int sources = rows.stream().mapToInt(e -> e.sources.size()).sum();
+        summary.setText(rows.size() + " links   •   " + sources + " source associations   •   " + unavailable + " unavailable   •   " + unknown + " unknown   |   Unavailable ≠ claimable");
+        applyFilter(); showDetails();
+    }
+    private void changed() {
+        List<Entry> selection = selected();
+        model.fireTableDataChanged();
+        for (Entry entry : selection) {
+            int index = rows.indexOf(entry);
+            if (index >= 0) { int view = table.convertRowIndexToView(index); if (view >= 0) table.addRowSelectionInterval(view,view); }
+        }
+        refresh();
+    }
+    private void log(String text) {
+        if (!SwingUtilities.isEventDispatchThread()) { SwingUtilities.invokeLater(() -> log(text)); return; }
+        if (unloaded) return;
+        callbacks.printOutput("[BLHify] " + text);
+        activity.append(LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss")) + "  " + text + "\n");
+        if (activity.getDocument().getLength() > 60000) activity.replaceRange("", 0, 15000);
+        activity.setCaretPosition(activity.getDocument().getLength());
+    }
+    @Override public void processHttpMessage(int toolFlag, boolean request, IHttpRequestResponse message) {
+        if (request || toolFlag != IBurpExtenderCallbacks.TOOL_PROXY || unloaded || !capture || message.getResponse() == null) return;
         try {
-            String xUrl = socialUrl.replaceFirst("(?i)twitter\\.com", "x.com");
-            callbacks.printOutput("    [X] Fetching: " + xUrl);
-
-            HttpURLConnection conn = openConnection(xUrl);
-            int status = conn.getResponseCode();
-            String finalUrl = conn.getURL().toString().toLowerCase();
-            callbacks.printOutput("    [X] Status: " + status + " | Final: " + finalUrl);
-
-            if (finalUrl.contains("/i/flow/login") || finalUrl.contains("/account/access")) {
-                callbacks.printOutput("    [X] -> Dead (redirected to login)");
-                return true;
+            URL url = helpers.analyzeRequest(message).getUrl();
+            if (SocialChecker.socialHost(url.getHost())) return;
+            if (scopeOnly && !callbacks.isInScope(url)) return;
+            byte[] response = message.getResponse();
+            if (response.length > 8 * 1024 * 1024) return;
+            // Snapshot before the listener returns; Burp may subsequently mutate the message.
+            byte[] snapshot = response.clone();
+            IHttpService service = message.getHttpService();
+            int epoch = generation;
+            discovery.execute(() -> discover(url, service, snapshot, epoch));
+        } catch (RejectedExecutionException e) { callbacks.printError("BLHify discovery queue full; response skipped."); }
+        catch (RuntimeException e) { callbacks.printError("BLHify discovery error: " + e.getMessage()); }
+    }
+    private void discover(URL page, IHttpService service, byte[] response, int epoch) {
+        if (unloaded) return;
+        try {
+            IResponseInfo info = helpers.analyzeResponse(response);
+            String type = "", encoding = "";
+            for (String header : info.getHeaders()) {
+                if (header.toLowerCase(Locale.ROOT).startsWith("content-type:")) type = header.toLowerCase(Locale.ROOT);
+                if (header.toLowerCase(Locale.ROOT).startsWith("content-encoding:")) encoding = header.substring(header.indexOf(':') + 1).trim();
             }
-
-            if (status == 404) {
-                callbacks.printOutput("    [X] -> Dead (404)");
-                return true;
+            if (!type.isEmpty() && !(type.contains("text/") || type.contains("json") || type.contains("javascript") || type.contains("xml"))) return;
+            InputStream input = new ByteArrayInputStream(response, info.getBodyOffset(), response.length - info.getBodyOffset());
+            if (encoding.equalsIgnoreCase("gzip")) input = new GZIPInputStream(input);
+            else if (encoding.equalsIgnoreCase("deflate")) input = new InflaterInputStream(input);
+            else if (!encoding.isEmpty() && !encoding.equalsIgnoreCase("identity")) return;
+            byte[] body;
+            try (InputStream in = input) { body = in.readNBytes(4 * 1024 * 1024 + 1); }
+            if (body.length > 4 * 1024 * 1024) { log("Skipped oversized response body: " + page); return; }
+            Map<String,SocialChecker.Profile> found = candidates(new String(body, StandardCharsets.UTF_8),type.contains("html") || type.isEmpty());
+            if (found.isEmpty()) return;
+            if (pendingUi.incrementAndGet() > 100) { pendingUi.decrementAndGet(); callbacks.printError("BLHify UI queue full; response skipped."); return; }
+            SwingUtilities.invokeLater(() -> {
+                try {
+                    if (unloaded || epoch != generation) return;
+                    for (Map.Entry<String,SocialChecker.Profile> foundLink : found.entrySet()) record(foundLink.getValue(),new Source(page,service,foundLink.getKey()));
+                    changed();
+                } finally { pendingUi.decrementAndGet(); }
+            });
+        } catch (Exception e) { log("Could not inspect response from " + page + ": " + e.getMessage()); }
+    }
+    static Map<String,SocialChecker.Profile> candidates(String body, boolean html) {
+        String text = SocialChecker.decodedLinks(body);
+        if (html) {
+            text = text.replaceAll("(?is)<!--.*?-->|<(script|style)\\b[^>]*>.*?</\\1\\s*>","");
+            Matcher anchors = java.util.regex.Pattern.compile("(?is)<a\\b[^>]*\\bhref\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)'|([^\\s>]+))").matcher(text);
+            StringBuilder links = new StringBuilder();
+            while (anchors.find()) {
+                String href = anchors.group(1) != null ? anchors.group(1) : anchors.group(2) != null ? anchors.group(2) : anchors.group(3);
+                links.append(href).append('\n');
             }
-
-            String body = readFullBody(conn);
-            callbacks.printOutput("    [X] Body length: " + body.length());
-
-            // Check for embedded JS data markers
-            if (body.contains("\"UserUnavailable\"") ||
-                body.contains("userUnavailable") ||
-                body.contains("this account doesn") ||
-                body.contains("This account doesn")) {
-                callbacks.printOutput("    [X] -> Dead (UserUnavailable in source)");
-                return true;
-            }
-
-            // og:title check: dead = "X", live = "Name (@handle) / X"
-            Pattern ogTitle = Pattern.compile(
-                    "og:title\"[^>]*content=\"([^\"]+)\"", Pattern.CASE_INSENSITIVE);
-            Matcher m = ogTitle.matcher(body);
-            if (m.find()) {
-                String title = m.group(1).trim();
-                callbacks.printOutput("    [X] og:title = " + title);
-                if (title.equalsIgnoreCase("x") || !title.contains("@")) {
-                    callbacks.printOutput("    [X] -> Dead (og:title has no @handle)");
-                    return true;
+            text = links.toString();
+        }
+        Matcher matcher = SocialChecker.LINKS.matcher(text);
+        Map<String,SocialChecker.Profile> found = new LinkedHashMap<>();
+        while (matcher.find() && found.size() < 500) {
+            String raw = matcher.group(); SocialChecker.Profile profile = SocialChecker.profile(raw);
+            if (profile != null && profile.supported) found.put(raw,profile);
+        }
+        return found;
+    }
+    private void record(SocialChecker.Profile profile, Source source) {
+        if (!profile.supported) return;
+        Entry entry = inventory.get(profile.url);
+        if (sourceCount >= 50000 && (entry == null || !entry.sources.containsKey(source.url.toString()))) {
+            log("Source association limit reached (50,000). Export and clear to continue."); return;
+        }
+        if (entry == null) {
+            if (rows.size() >= MAX_LINKS) { log("Inventory limit reached (10,000 links). Export and clear to continue."); return; }
+            entry = new Entry(profile); inventory.put(profile.url,entry); rows.add(entry);
+            model.fireTableRowsInserted(rows.size()-1, rows.size()-1);
+        }
+        if (entry.sources.size() < MAX_SOURCES || entry.sources.containsKey(source.url.toString())) {
+            if (entry.sources.putIfAbsent(source.url.toString(),source) == null) sourceCount++;
+        }
+        else { log("Source limit reached for " + profile.url); return; }
+        if (automatic && entry.result.status == SocialChecker.Status.DISCOVERED) queue(entry);
+        report(entry);
+    }
+    private void queue(Entry entry) {
+        if (unloaded || !entry.profile.supported || entry.busy) return;
+        int epoch = generation;
+        entry.busy = true; entry.result = SocialChecker.result(SocialChecker.Status.QUEUED,"Waiting for a native check.");
+        try {
+            checks.execute(() -> {
+                SwingUtilities.invokeLater(() -> { if (valid(entry,epoch)) { entry.result = SocialChecker.result(SocialChecker.Status.CHECKING,"Contacting " + entry.profile.platform + " anonymously..."); changed(); } });
+                SocialChecker.Result result;
+                if (System.currentTimeMillis() < cooldowns.getOrDefault(entry.profile.platform,0L)) {
+                    result = SocialChecker.result(SocialChecker.Status.UNKNOWN,"Platform cooling down after HTTP 429; retry in a few minutes.");
+                } else {
+                    result = new SocialChecker().check(entry.profile);
+                    if (result.reason.contains("HTTP 429")) cooldowns.put(entry.profile.platform,System.currentTimeMillis() + 120000L);
                 }
-            } else {
-                // No og:title found - check if handle appears anywhere in source
-                String handle = extractHandle(socialUrl).toLowerCase();
-                callbacks.printOutput("    [X] No og:title found, checking for handle: " + handle);
-                if (!handle.isEmpty() && !body.toLowerCase().contains(handle)) {
-                    callbacks.printOutput("    [X] -> Dead (handle not found in source)");
-                    return true;
-                }
-            }
-
-        } catch (Exception e) {
-            callbacks.printOutput("    [X] Error: " + e.getMessage());
-        }
-        return false;
+                final SocialChecker.Result completed = result;
+                SwingUtilities.invokeLater(() -> {
+                    if (!valid(entry,epoch)) return;
+                    entry.busy = false; entry.result = completed; entry.checked = java.time.Instant.now().toString();
+                    log(entry.profile.platform + " " + entry.profile.url + " -> " + completed.status + ": " + completed.reason);
+                    report(entry); changed();
+                });
+                try { Thread.sleep(1000); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            });
+        } catch (RejectedExecutionException e) { entry.busy = false; entry.result = SocialChecker.result(SocialChecker.Status.DISCOVERED,"Check queue full; use Check pending / unknown to retry."); }
+        changed();
     }
-
-    // ===================== TIKTOK =====================
-    // TikTok returns 404 for dead accounts or embeds user_not_found in JSON
-    private boolean checkTiktok(String socialUrl) {
-        try {
-            callbacks.printOutput("    [TT] Fetching: " + socialUrl);
-
-            HttpURLConnection conn = openConnection(socialUrl);
-            int status = conn.getResponseCode();
-            callbacks.printOutput("    [TT] Status: " + status);
-
-            if (status == 404) {
-                callbacks.printOutput("    [TT] -> Dead (404)");
-                return true;
-            }
-
-            String body = readFullBody(conn);
-            callbacks.printOutput("    [TT] Body length: " + body.length());
-
-            if (body.contains("couldn't find this account") ||
-                body.contains("Couldn\u2019t find this account") ||
-                body.contains("user not found") ||
-                body.contains("\"statusCode\":10202") ||
-                body.contains("\"message\":\"user_not_found\"")) {
-                callbacks.printOutput("    [TT] -> Dead (user not found)");
-                return true;
-            }
-
-            // og:title check: dead = "TikTok" only
-            Pattern ogTitle = Pattern.compile(
-                    "og:title\"[^>]*content=\"([^\"]+)\"", Pattern.CASE_INSENSITIVE);
-            Matcher m = ogTitle.matcher(body);
-            if (m.find()) {
-                String title = m.group(1).trim();
-                callbacks.printOutput("    [TT] og:title = " + title);
-                if (title.equalsIgnoreCase("tiktok") || !title.contains("@")) {
-                    callbacks.printOutput("    [TT] -> Dead (generic og:title)");
-                    return true;
-                }
-            }
-
-        } catch (Exception e) {
-            callbacks.printOutput("    [TT] Error: " + e.getMessage());
-        }
-        return false;
-    }
-
-    private String extractHandle(String socialUrl) {
-        try {
-            String path = new URI(socialUrl).getPath();
-            return path.replaceAll("^/+", "").split("/")[0].replace("@", "");
-        } catch (Exception e) {
-            return "";
+    private boolean valid(Entry entry,int epoch) { return !unloaded && epoch == generation && inventory.get(entry.profile.url) == entry; }
+    private void report(Entry entry) {
+        if (entry.result.status != SocialChecker.Status.UNAVAILABLE) return;
+        for (Source source : entry.sources.values()) {
+            if (entry.reported.contains(source.url.toString())) continue;
+            try { callbacks.addScanIssue(new BLHIssue(source,entry.profile.url,entry.result.reason)); entry.reported.add(source.url.toString()); }
+            catch (RuntimeException e) { log("Unable to add Burp issue: " + e.getMessage()); }
         }
     }
-
-    private HttpURLConnection openConnection(String urlStr) throws Exception {
-        URL url = new URI(urlStr).toURL();
-        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-        conn.setRequestMethod("GET");
-        conn.setInstanceFollowRedirects(true);
-        conn.setConnectTimeout(10000);
-        conn.setReadTimeout(10000);
-        conn.setRequestProperty("User-Agent",
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36");
-        conn.setRequestProperty("Accept",
-                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
-        conn.setRequestProperty("Accept-Language", "en-US,en;q=0.9");
-        conn.setRequestProperty("Accept-Encoding", "identity"); // plain text, no gzip
-        conn.setRequestProperty("Cache-Control", "no-cache");
-        return conn;
+    private void exportCsv() {
+        JFileChooser chooser = new JFileChooser(); chooser.setSelectedFile(new File("BLHify-links.csv"));
+        if (chooser.showSaveDialog(panel) != JFileChooser.APPROVE_OPTION) return;
+        File target = chooser.getSelectedFile();
+        if (target.exists() && JOptionPane.showConfirmDialog(panel,"Replace " + target.getName() + "?","Export CSV",JOptionPane.YES_NO_OPTION) != JOptionPane.YES_OPTION) return;
+        StringBuilder csv = new StringBuilder("Platform,Social URL,Status,Reason,Source page,Original URL,Checked at UTC\r\n");
+        for (Entry entry : rows) for (Source source : entry.sources.values()) {
+            StringJoiner line = new StringJoiner(",");
+            for (String value : Arrays.asList(entry.profile.platform,entry.profile.url,entry.result.status.name(),entry.result.reason,source.url.toString(),source.original,entry.checked)) line.add(csvCell(value));
+            csv.append(line).append("\r\n");
+        }
+        new SwingWorker<Void,Void>() {
+            @Override protected Void doInBackground() throws Exception { Files.write(target.toPath(),csv.toString().getBytes(StandardCharsets.UTF_8)); return null; }
+            @Override protected void done() { try { get(); log("Exported inventory to " + target); } catch (Exception e) { log("CSV export failed: " + e.getMessage()); } }
+        }.execute();
     }
-
-    // Read entire body (no line limit - we need full FB JSON)
-    private String readFullBody(HttpURLConnection conn) throws Exception {
-        BufferedReader reader;
-        try {
-            reader = new BufferedReader(new InputStreamReader(conn.getInputStream()));
-        } catch (Exception e) {
-            if (conn.getErrorStream() != null) {
-                reader = new BufferedReader(new InputStreamReader(conn.getErrorStream()));
-            } else {
-                return "";
-            }
-        }
-
-        StringBuilder sb = new StringBuilder();
-        String line;
-        while ((line = reader.readLine()) != null) {
-            sb.append(line).append("\n");
-        }
-        reader.close();
-        return sb.toString();
+    static String csvCell(String value) { if (value.matches("^[=+@\\-\\t\\r\\n].*")) value = "'" + value; return "\"" + value.replace("\"","\"\"") + "\""; }
+    @Override public void extensionUnloaded() { unloaded = true; checks.shutdownNow(); discovery.shutdownNow(); }
+    private static class Source {
+        final URL url; final IHttpService service; final String original;
+        Source(URL url,IHttpService service,String original) { this.url = url; this.service = service; this.original = original; }
     }
-
-    // === CUSTOM ISSUE CLASS ===
-    static class BLHIssue implements IScanIssue {
-
-        private final IHttpService service;
-        private final URL pageUrl;
-        private final String socialUrl;
-
-        BLHIssue(IHttpService service, URL pageUrl, String socialUrl) {
-            this.service = service;
-            this.pageUrl = pageUrl;
-            this.socialUrl = socialUrl;
+    private static class Entry {
+        final SocialChecker.Profile profile;
+        final Map<String,Source> sources = new LinkedHashMap<>();
+        final Set<String> reported = new HashSet<>();
+        SocialChecker.Result result; boolean busy; String checked = "Not checked";
+        Entry(SocialChecker.Profile profile) { this.profile = profile; result = SocialChecker.result(profile.supported ? SocialChecker.Status.DISCOVERED : SocialChecker.Status.UNSUPPORTED,profile.supported ? "Waiting to be checked." : "Recorded only: unsupported platform or non-profile URL."); }
+    }
+    private final class LinkModel extends AbstractTableModel {
+        private final String[] columns = {"Platform","Social link","Status","Pages","Evidence / reason","Checked (UTC)"};
+        public int getRowCount() { return rows.size(); } public int getColumnCount() { return columns.length; }
+        public String getColumnName(int c) { return columns[c]; } public Class<?> getColumnClass(int c) { return c == 3 ? Integer.class : String.class; }
+        public Object getValueAt(int r,int c) {
+            Entry entry = rows.get(r);
+            switch(c) { case 0: return entry.profile.platform; case 1: return entry.profile.url; case 2: return entry.result.status.name(); case 3: return entry.sources.size(); case 4: return entry.result.reason; default: return entry.checked; }
         }
-
-        @Override public URL getUrl() { return pageUrl; }
-        @Override public String getIssueName() { return "Broken Social Link Hijack"; }
-        @Override public int getIssueType() { return 0x08000000; }
-        @Override public String getSeverity() { return "Low"; }
-        @Override public String getConfidence() { return "Firm"; }
-
-        @Override
-        public String getIssueBackground() {
-            return "Broken social media links may allow attackers to register the missing account and impersonate the organization.";
-        }
-
-        @Override
-        public String getRemediationBackground() {
-            return "Ensure all social links point to valid accounts or remove them if unused.";
-        }
-
-        @Override
-        public String getIssueDetail() {
-            return "The page contains a broken social media link:<br><br>"
-                    + "<b>" + socialUrl + "</b><br><br>"
-                    + "An attacker may claim this handle and impersonate the brand.";
-        }
-
-        @Override public String getRemediationDetail() { return null; }
-        @Override public IHttpRequestResponse[] getHttpMessages() { return null; }
-        @Override public IHttpService getHttpService() { return service; }
-        @Override public String getProtocol() { return service.getProtocol(); }
-        @Override public int getPort() { return service.getPort(); }
-        @Override public String getHost() { return service.getHost(); }
+    }
+    static String html(String value) { return value.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;").replace("\"","&quot;").replace("'","&#39;"); }
+    private static final class BLHIssue implements IScanIssue {
+        private final Source source; private final String social, reason;
+        BLHIssue(Source source,String social,String reason) { this.source = source; this.social = social; this.reason = reason; }
+        public URL getUrl() { return source.url; } public String getIssueName() { return "Unavailable social profile link"; }
+        public int getIssueType() { return 0x08000000; } public String getSeverity() { return "Information"; } public String getConfidence() { return "Tentative"; }
+        public String getIssueBackground() { return "An unavailable social profile may leave a stale link. Account availability and handle claimability require manual verification."; }
+        public String getRemediationBackground() { return "Verify the intended account and update or remove stale links."; }
+        public String getIssueDetail() { return "Social profile: <b>" + html(social) + "</b><br>Found on: " + html(source.url.toString()) + "<br>Signal: " + html(reason) + "<br>This anonymous check does not prove account deletion or a takeover vulnerability."; }
+        public String getRemediationDetail() { return null; } public IHttpRequestResponse[] getHttpMessages() { return null; }
+        public IHttpService getHttpService() { return source.service; }
     }
 }
